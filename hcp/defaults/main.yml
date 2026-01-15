@@ -21,6 +21,12 @@ iam:
   hcp_users: {}
     #- list of users to bind to IAM policy
 
-#Validated Parameters 
+#Validated Parameters
 wait_timeout_seconds: 900        # Max time to wait (900 seconds = 15 minutes)
 check_interval_seconds: 10       # How often to poll the resource status
+
+# Additional tags to apply to AWS resources created by hcp CLI
+# Format: "Key1=Value1,Key2=Value2" or list ["Key1=Value1", "Key2=Value2"]
+# Can be set globally here or per-cluster in vars.yml
+# Example: additional_tags: "ManagedBy=hypershift-ci,Environment=test"
+additional_tags: ""

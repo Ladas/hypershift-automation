@@ -8,6 +8,13 @@ create_iam: false
 # Base domain - constant for all clusters
 domain: aws.validatedpatterns.io
 
+# Additional tags to apply to all AWS resources (EC2, ELB, etc.)
+# Format: "Key1=Value1,Key2=Value2"
+# Can also be set per-cluster using cluster.additional_tags
+# Example for CI with scoped IAM policies:
+#   additional_tags: "ManagedBy=hypershift-ci,Environment=ci"
+additional_tags: ""
+
 # Clusters list - Define multiple clusters with different characteristics
 # Each cluster can have its own region, instance_type, image (version), replicas, etc.
 # Use 'count' to create multiple clusters of the same type with auto-incremented names
@@ -32,3 +39,5 @@ clusters:
     replicas: 1
     instance_type: m5.2xlarge
     image: 4.18.28
+    # Per-cluster tags (overrides global additional_tags)
+    # additional_tags: "ManagedBy=hypershift-ci,Team=platform"

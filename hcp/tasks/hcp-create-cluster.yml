@@ -54,16 +54,21 @@
     zones: "{{ az_info.availability_zones | map(attribute='zone_name') | list |join(',')}}"
   when: cluster.spread_across_availability_zones | default(false)
 
+# Determine effective additional_tags (per-cluster overrides global)
+- name: "deploy | set effective additional_tags for {{ cluster.name }}"
+  set_fact:
+    effective_additional_tags: "{{ cluster.additional_tags | default(additional_tags) | default('') }}"
+
 # Create the hypershift cluster when create = true, the hc resource above is not changed and when destroy=false
 - name: "deploy | create cluster {{ cluster.name }}"
   ansible.builtin.shell: >
-    hcp create cluster aws 
-    --name {{ cluster.name }} 
-    --node-pool-replicas {{ cluster.replicas }} 
-    --instance-type {{ cluster.instance_type }} 
-    --infra-id {{ cluster.name }} 
+    hcp create cluster aws
+    --name {{ cluster.name }}
+    --node-pool-replicas {{ cluster.replicas }}
+    --instance-type {{ cluster.instance_type }}
+    --infra-id {{ cluster.name }}
     --base-domain {{ domain }}
-    --pull-secret {{ pull_secret_path }} 
+    --pull-secret {{ pull_secret_path }}
     --region {{ cluster.region }}
     {% if cluster.spread_across_availability_zones | default(false) %}
     --zones {{ zones }}
@@ -75,6 +80,9 @@
     {% endif %}
     --sts-creds {{ sts_creds.dir }}/{{ sts_creds.file }}
     --role-arn {{ hcp_role_arn }}
+    {% if effective_additional_tags %}
+    --additional-tags {{ effective_additional_tags }}
+    {% endif %}
   args:
     executable: "{{lookup('ansible.builtin.env', 'SHELL')}}"
   async: 3600  # 1 hour timeout

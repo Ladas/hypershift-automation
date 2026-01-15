@@ -18,7 +18,7 @@ This list of variables are for the cluster lifecycle.
 |-----------|---------|-------------|
 | create    | false   | set true to create cluster |
 | destroy   | false   | set true to destroy cluster |
-| create_iam | false | set true to create iam roles and policies | 
+| create_iam | false | set true to create iam roles and policies |
 | name | `hcpdflt` | cluster name (also used for infraID) |
 | replicas | `1` | Number of machines to create |
 | instance_type | `m5.xlarge` | AWS Machine type |
@@ -26,6 +26,7 @@ This list of variables are for the cluster lifecycle.
 | region | `us-west-2` | default region to deploy resources |
 | image | `latest` | OpenShift version to deploy |
 | spread_across_availability_zones | `false` | Single or Multiple availability zone deployment |
+| additional_tags | `""` | AWS resource tags in format "Key1=Value1,Key2=Value2" |
 
 ### Default Variables 
 
