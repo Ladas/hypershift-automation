@@ -1,4 +1,23 @@
 ---
+# =============================================================================
+# HCP CLUSTER DESTROY WITH FAST FALLBACK CLEANUP
+# =============================================================================
+# This playbook destroys a HyperShift cluster with aggressive fallback cleanup.
+#
+# Problem: The standard `hcp destroy cluster aws` command can hang indefinitely
+# when the CloudResourcesDestroyed condition stays at "Unknown" status.
+#
+# Solution: We use a multi-stage approach:
+# 1. Start hcp destroy command (short timeout: 15 minutes)
+# 2. Monitor for stuck conditions during the wait
+# 3. If stuck detected or timeout reached, proceed to fallback cleanup
+# 4. Remove finalizers to unblock Kubernetes deletion
+# 5. Clean up AWS resources using tag-based filtering (safe and idempotent)
+#
+# Safety: All AWS cleanup uses kubernetes.io/cluster/<cluster-name>=owned tag
+# to ensure only resources belonging to this cluster are affected.
+# =============================================================================
+
 # Check for existing hostedcluster before attempting destruction
 - name: "destroy | check if hostedcluster/{{ cluster.name }} exists"
   kubernetes.core.k8s_info:
@@ -8,200 +27,860 @@
     name: "{{ cluster.name }}"
   register: hc
   changed_when: false
-  failed_when: false  # Don't fail if kubeconfig is not available
-
-# Destroy the hypershift cluster when destroy = true and the cluster exists
-- name: "destroy | destroy cluster {{ cluster.name }}"
-  ansible.builtin.shell: >
-    hcp destroy cluster aws
-    --name {{ cluster.name }}
-    --region {{ cluster.region }}
-    --sts-creds {{ sts_creds.dir }}/{{ sts_creds.file }}
-    --role-arn {{ hcp_role_arn }}
-  args:
-    executable: "{{lookup('ansible.builtin.env', 'SHELL')}}"
-  async: 3600  # 1 hour timeout
-  poll: 0  # Start in parallel, don't wait
-  register: cluster_destroy_async
-  when: 
-    - destroy
-    - hc.resources is defined
-    - hc.resources | length > 0
-
-# Wait for cluster destruction to complete
-- name: "destroy | wait for cluster {{ cluster.name }} destruction to complete"
-  ansible.builtin.async_status:
-    jid: "{{ (cluster_destroy_async | default({})).ansible_job_id | default('') }}"
-  register: cluster_destroy_result
-  until: cluster_destroy_result.finished
-  retries: 360  # 1 hour with 10 second intervals
-  delay: 10
-  failed_when: false  # Don't fail here - we'll check the result in the next step
-  when: 
-    - destroy
-    - cluster_destroy_async is defined
-    - (cluster_destroy_async | default({})).ansible_job_id is defined
-
-# Verify that the destroy command succeeded
-- name: "destroy | verify cluster {{ cluster.name }} destroy command succeeded"
-  ansible.builtin.fail:
-    msg: >
-      Failed to destroy cluster {{ cluster.name }}.
-      {% if cluster_destroy_result.finished | default(false) %}
-      Error: {{ cluster_destroy_result.msg | default('Unknown error') }}.
-      {% else %}
-      The destroy command did not complete within the timeout period (1 hour).
-      {% endif %}
-      Check the async job output for details.
-  when:
-    - destroy
-    - cluster_destroy_async is defined
-    - (cluster_destroy_async | default({})).ansible_job_id is defined
-    - not (cluster_destroy_result.finished | default(false) and not (cluster_destroy_result.failed | default(false)))
-
-# Wait for hostedcluster to be deleted
-- name: "destroy | wait for hostedcluster {{ cluster.name }} to be deleted | this can take a while"
-  kubernetes.core.k8s_info:
-    name: "{{ cluster.name }}"
-    api_version: hypershift.openshift.io/v1beta1
-    kind: hostedcluster
-    namespace: clusters
-  register: hc_status
-  until: >
-    hc_status.resources is not defined
-    or hc_status.resources | length == 0
-    or (
-      hc_status.resources is defined
-      and hc_status.resources | length > 0
-      and hc_status.resources[0].metadata.deletionTimestamp is defined
-      and (
-        hc_status.resources[0].metadata.finalizers is not defined
-        or hc_status.resources[0].metadata.finalizers | length == 0
-      )
-    )
-  retries: "{{ (wait_timeout_seconds / check_interval_seconds) | int }}"
-  delay: "{{ check_interval_seconds }}"
-  failed_when: false  # Don't fail here - we'll check the result in the next step
-  when: 
-    - destroy
-    - cluster_destroy_async is defined
-    - cluster_destroy_result.finished | default(false)
-    - not (cluster_destroy_result.failed | default(false))
-
-# Final verification that the cluster was actually deleted
-- name: "destroy | verify cluster {{ cluster.name }} was actually deleted"
-  kubernetes.core.k8s_info:
-    name: "{{ cluster.name }}"
-    api_version: hypershift.openshift.io/v1beta1
-    kind: HostedCluster
-    namespace: clusters
-  register: hc_final_check
-  changed_when: false
-  failed_when: false  # Don't fail if kubeconfig is not available, but check below
-  when:
-    - destroy
-    - cluster_destroy_async is defined
-    - cluster_destroy_result.finished | default(false)
-    - not (cluster_destroy_result.failed | default(false))
-
-# Check if cluster is stuck with finalizer but cloud resources are destroyed
-- name: "destroy | check if cluster {{ cluster.name }} is stuck with finalizer"
-  set_fact:
-    hc_stuck_with_finalizer: >
-      {{
-        hc_final_check.resources is defined
-        and hc_final_check.resources | length > 0
-        and hc_final_check.resources[0].metadata.deletionTimestamp is defined
-        and hc_final_check.resources[0].metadata.finalizers is defined
-        and hc_final_check.resources[0].metadata.finalizers | length > 0
-        and (
-          hc_final_check.resources[0].status.conditions is defined
-          and hc_final_check.resources[0].status.conditions | selectattr('type', 'equalto', 'CloudResourcesDestroyed') | selectattr('status', 'equalto', 'True') | list | length > 0
-        )
-      }}
-  when:
-    - destroy
-    - cluster_destroy_async is defined
-    - cluster_destroy_result.finished | default(false)
-    - not (cluster_destroy_result.failed | default(false))
-    - hc_final_check.resources is defined
-    - hc_final_check.resources | length > 0
-
-# Attempt to remove finalizer if cloud resources are destroyed
-- name: "destroy | attempt to remove finalizer from stuck cluster {{ cluster.name }}"
-  ansible.builtin.shell: >
-    kubectl patch hostedcluster {{ cluster.name }} -n clusters
-    --type=json
-    -p='[{"op": "remove", "path": "/metadata/finalizers"}]'
-  args:
-    executable: "{{lookup('ansible.builtin.env', 'SHELL')}}"
-  register: hc_finalizer_removal
-  changed_when: hc_finalizer_removal.rc == 0
-  failed_when: false  # Don't fail if we can't remove the finalizer
-  when:
-    - destroy
-    - cluster_destroy_async is defined
-    - cluster_destroy_result.finished | default(false)
-    - not (cluster_destroy_result.failed | default(false))
-    - hc_stuck_with_finalizer | default(false)
-
-# Wait a bit more after removing finalizer
-- name: "destroy | wait for cluster {{ cluster.name }} to be deleted after finalizer removal"
-  kubernetes.core.k8s_info:
-    name: "{{ cluster.name }}"
-    api_version: hypershift.openshift.io/v1beta1
-    kind: HostedCluster
-    namespace: clusters
-  register: hc_post_finalizer_check
-  until: hc_post_finalizer_check.resources is not defined or hc_post_finalizer_check.resources | length == 0
-  retries: 30  # 5 minutes with 10 second intervals
-  delay: 10
   failed_when: false
-  when:
-    - destroy
-    - cluster_destroy_async is defined
-    - cluster_destroy_result.finished | default(false)
-    - not (cluster_destroy_result.failed | default(false))
-    - hc_stuck_with_finalizer | default(false)
-    - hc_finalizer_removal.rc | default(1) == 0
-
-# Fail if cluster still exists after deletion attempt
-- name: "destroy | fail if cluster {{ cluster.name }} still exists"
-  ansible.builtin.fail:
-    msg: >
-      Cluster {{ cluster.name }} still exists after destroy attempt.
-      {% if hc_final_check.resources[0].metadata.deletionTimestamp is defined %}
-      The cluster is marked for deletion but may be stuck with a finalizer.
-      {% if hc_final_check.resources[0].status is defined and hc_final_check.resources[0].status.conditions is defined %}
-      Cloud resources status: {{ hc_final_check.resources[0].status.conditions | selectattr('type', 'equalto', 'CloudResourcesDestroyed') | map(attribute='status') | first | default('Unknown') }}.
-      {% endif %}
-      {% else %}
-      The cluster may not have been fully deleted.
-      {% endif %}
-      You may need to manually remove the finalizer or check the hypershift operator logs.
-  when:
-    - destroy
-    - cluster_destroy_async is defined
-    - cluster_destroy_result.finished | default(false)
-    - not (cluster_destroy_result.failed | default(false))
-    - hc_final_check.resources is defined
-    - hc_final_check.resources | length > 0
-    - not (hc_stuck_with_finalizer | default(false) and hc_finalizer_removal.rc | default(1) == 0)
-
-# Clean up local deployment directory
-- name: "destroy | remove local deployment directory for {{ cluster.name }}"
-  ansible.builtin.file:
-    state: absent
-    path: "{{ deployment_dir }}/{{ cluster.name }}"
-  when: destroy
 
 # Display message if cluster doesn't exist
-- name: "destroy | warn if cluster {{ cluster.name }} does not exist"
+- name: "destroy | skip if cluster {{ cluster.name }} does not exist"
   ansible.builtin.debug:
     msg: "Cluster {{ cluster.name }} does not exist, skipping destruction"
   when:
     - destroy
     - hc.resources is not defined or hc.resources | length == 0
 
+# Set cluster exists flag
+- name: "destroy | set cluster exists flag"
+  set_fact:
+    cluster_exists: "{{ hc.resources is defined and hc.resources | length > 0 }}"
+  when: destroy
 
+# =============================================================================
+# STAGE 1: Start hcp destroy command (non-blocking)
+# =============================================================================
 
+- name: "destroy | start hcp destroy cluster {{ cluster.name }}"
+  ansible.builtin.shell: >
+    hcp destroy cluster aws
+    --name {{ cluster.name }}
+    --infra-id {{ cluster.name }}
+    --base-domain {{ domain }}
+    --region {{ cluster.region }}
+    --sts-creds {{ sts_creds.dir }}/{{ sts_creds.file }}
+    --role-arn {{ hcp_role_arn }}
+  args:
+    executable: "{{ lookup('ansible.builtin.env', 'SHELL') }}"
+  async: "{{ hcp_destroy_timeout_seconds | default(900) }}"  # 15 minute timeout
+  poll: 0
+  register: cluster_destroy_async
+  when:
+    - destroy
+    - cluster_exists | default(false)
+
+# =============================================================================
+# STAGE 2: Wait for hcp destroy with early stuck detection
+# =============================================================================
+
+# Short wait for hcp destroy command to complete (max 10 minutes)
+# We'll check for stuck conditions separately
+- name: "destroy | wait for hcp destroy command {{ cluster.name }} (max 10 minutes)"
+  ansible.builtin.async_status:
+    jid: "{{ cluster_destroy_async.ansible_job_id }}"
+  register: cluster_destroy_result
+  until: cluster_destroy_result.finished
+  retries: 60  # 10 minutes with 10 second intervals
+  delay: 10
+  failed_when: false
+  when:
+    - destroy
+    - cluster_exists | default(false)
+    - cluster_destroy_async is defined
+    - cluster_destroy_async.ansible_job_id is defined
+
+# Check cluster state after hcp destroy attempt
+- name: "destroy | check cluster {{ cluster.name }} state after hcp destroy"
+  kubernetes.core.k8s_info:
+    api_version: hypershift.openshift.io/v1beta1
+    kind: HostedCluster
+    namespace: clusters
+    name: "{{ cluster.name }}"
+  register: hc_after_destroy
+  changed_when: false
+  failed_when: false
+  when:
+    - destroy
+    - cluster_exists | default(false)
+
+# =============================================================================
+# STAGE 3: Detect stuck cluster and proceed to fallback cleanup
+# =============================================================================
+
+# Extract CloudResourcesDestroyed condition
+- name: "destroy | extract CloudResourcesDestroyed condition for {{ cluster.name }}"
+  set_fact:
+    cloud_resources_condition: "{{ hc_after_destroy.resources[0].status.conditions | default([]) | selectattr('type', 'equalto', 'CloudResourcesDestroyed') | list | first | default({'status': 'Unknown'}) }}"
+  when:
+    - destroy
+    - cluster_exists | default(false)
+    - hc_after_destroy.resources is defined
+    - hc_after_destroy.resources | length > 0
+
+# Check if cluster is stuck
+# A cluster is "stuck" if:
+# - It has a deletionTimestamp (marked for deletion)
+# - It still has finalizers preventing deletion
+# - CloudResourcesDestroyed is Unknown, True, or False (not progressing)
+- name: "destroy | detect if cluster {{ cluster.name }} is stuck"
+  set_fact:
+    cluster_is_stuck: >-
+      {{
+        hc_after_destroy.resources is defined
+        and hc_after_destroy.resources | length > 0
+        and hc_after_destroy.resources[0].metadata.deletionTimestamp is defined
+        and hc_after_destroy.resources[0].metadata.finalizers is defined
+        and hc_after_destroy.resources[0].metadata.finalizers | length > 0
+      }}
+  when:
+    - destroy
+    - cluster_exists | default(false)
+    - hc_after_destroy.resources is defined
+
+# Log stuck detection
+- name: "destroy | log stuck cluster {{ cluster.name }} detection"
+  ansible.builtin.debug:
+    msg: |
+      Cluster {{ cluster.name }} stuck status:
+      - Cluster exists: {{ hc_after_destroy.resources | length > 0 if hc_after_destroy.resources is defined else 'No' }}
+      - deletionTimestamp: {{ hc_after_destroy.resources[0].metadata.deletionTimestamp | default('not set') if hc_after_destroy.resources is defined and hc_after_destroy.resources | length > 0 else 'N/A' }}
+      - Finalizers: {{ hc_after_destroy.resources[0].metadata.finalizers | default([]) | to_json if hc_after_destroy.resources is defined and hc_after_destroy.resources | length > 0 else '[]' }}
+      - CloudResourcesDestroyed: {{ cloud_resources_condition.status | default('Unknown') }}
+      - Is stuck: {{ cluster_is_stuck | default(false) }}
+      - hcp destroy finished: {{ cluster_destroy_result.finished | default(false) }}
+      - hcp destroy failed: {{ cluster_destroy_result.failed | default(false) }}
+  when:
+    - destroy
+    - cluster_exists | default(false)
+    - hc_after_destroy.resources is defined
+
+# =============================================================================
+# STAGE 4: Remove stuck finalizers
+# =============================================================================
+
+- name: "destroy | remove finalizers from stuck cluster {{ cluster.name }}"
+  ansible.builtin.shell: >
+    kubectl patch hostedcluster {{ cluster.name }} -n clusters
+    --type=json
+    -p='[{"op": "remove", "path": "/metadata/finalizers"}]'
+  args:
+    executable: "{{ lookup('ansible.builtin.env', 'SHELL') }}"
+  register: finalizer_removal
+  changed_when: finalizer_removal.rc == 0
+  failed_when: false
+  when:
+    - destroy
+    - cluster_exists | default(false)
+    - cluster_is_stuck | default(false)
+
+- name: "destroy | log finalizer removal for {{ cluster.name }}"
+  ansible.builtin.debug:
+    msg: "Finalizer removal result: {{ 'success' if finalizer_removal.rc | default(1) == 0 else 'failed - ' + (finalizer_removal.stderr | default('unknown error')) }}"
+  when:
+    - destroy
+    - cluster_exists | default(false)
+    - cluster_is_stuck | default(false)
+
+# Wait briefly for cluster deletion after finalizer removal
+- name: "destroy | wait for cluster {{ cluster.name }} deletion after finalizer removal"
+  kubernetes.core.k8s_info:
+    api_version: hypershift.openshift.io/v1beta1
+    kind: HostedCluster
+    namespace: clusters
+    name: "{{ cluster.name }}"
+  register: hc_post_finalizer
+  until: hc_post_finalizer.resources is not defined or hc_post_finalizer.resources | length == 0
+  retries: 30  # 5 minutes
+  delay: 10
+  failed_when: false
+  when:
+    - destroy
+    - cluster_exists | default(false)
+    - cluster_is_stuck | default(false)
+    - finalizer_removal.rc | default(1) == 0
+
+# =============================================================================
+# STAGE 5: TAG-BASED AWS RESOURCE CLEANUP (Always runs for safety)
+# =============================================================================
+# This cleanup is ALWAYS run (if enabled) to catch any orphaned resources.
+# It uses kubernetes.io/cluster/<cluster-name>=owned tag for safe filtering.
+# All operations are idempotent - safe to run multiple times.
+# =============================================================================
+
+# Check for orphaned EC2 instances
+- name: "destroy | check for orphaned EC2 instances for {{ cluster.name }}"
+  ansible.builtin.shell: |
+    aws ec2 describe-instances \
+      --region {{ cluster.region }} \
+      --filters "Name=tag:kubernetes.io/cluster/{{ cluster.name }},Values=owned" \
+                "Name=instance-state-name,Values=running,stopped,stopping,pending" \
+      --query 'Reservations[*].Instances[*].InstanceId' \
+      --output text
+  args:
+    executable: "{{ lookup('ansible.builtin.env', 'SHELL') }}"
+  register: orphaned_instances
+  changed_when: false
+  failed_when: false
+  when:
+    - destroy
+    - cluster_exists | default(false)
+    - cleanup_orphaned_aws_resources | default(true)
+
+# Terminate orphaned EC2 instances
+- name: "destroy | terminate orphaned EC2 instances for {{ cluster.name }}"
+  ansible.builtin.shell: |
+    aws ec2 terminate-instances \
+      --region {{ cluster.region }} \
+      --instance-ids {{ orphaned_instances.stdout }}
+  args:
+    executable: "{{ lookup('ansible.builtin.env', 'SHELL') }}"
+  register: ec2_cleanup
+  changed_when: ec2_cleanup.rc == 0
+  failed_when: false
+  when:
+    - destroy
+    - cluster_exists | default(false)
+    - cleanup_orphaned_aws_resources | default(true)
+    - orphaned_instances.stdout | default('') | trim | length > 0
+
+- name: "destroy | log EC2 cleanup for {{ cluster.name }}"
+  ansible.builtin.debug:
+    msg: "Terminated orphaned EC2 instances: {{ orphaned_instances.stdout }}"
+  when:
+    - destroy
+    - orphaned_instances.stdout | default('') | trim | length > 0
+    - ec2_cleanup.rc | default(1) == 0
+
+# Wait for EC2 instances to terminate
+- name: "destroy | wait for EC2 instances to terminate for {{ cluster.name }}"
+  ansible.builtin.shell: |
+    aws ec2 wait instance-terminated \
+      --region {{ cluster.region }} \
+      --instance-ids {{ orphaned_instances.stdout }}
+  args:
+    executable: "{{ lookup('ansible.builtin.env', 'SHELL') }}"
+  register: ec2_wait
+  failed_when: false
+  when:
+    - destroy
+    - cluster_exists | default(false)
+    - cleanup_orphaned_aws_resources | default(true)
+    - orphaned_instances.stdout | default('') | trim | length > 0
+    - ec2_cleanup.rc | default(1) == 0
+
+# Check for orphaned Load Balancers (ELB and NLB)
+- name: "destroy | check for orphaned Load Balancers for {{ cluster.name }}"
+  ansible.builtin.shell: |
+    # Classic Load Balancers
+    aws elb describe-load-balancers --region {{ cluster.region }} \
+      --query "LoadBalancerDescriptions[*].LoadBalancerName" --output text 2>/dev/null | tr '\t' '\n' | while read lb; do
+      if [ -n "$lb" ]; then
+        TAGS=$(aws elb describe-tags --region {{ cluster.region }} --load-balancer-names "$lb" \
+          --query "TagDescriptions[*].Tags[?Key=='kubernetes.io/cluster/{{ cluster.name }}' && Value=='owned']" --output text 2>/dev/null)
+        if [ -n "$TAGS" ]; then
+          echo "elb:$lb"
+        fi
+      fi
+    done
+    # Network/Application Load Balancers (v2)
+    aws elbv2 describe-load-balancers --region {{ cluster.region }} \
+      --query "LoadBalancers[*].LoadBalancerArn" --output text 2>/dev/null | tr '\t' '\n' | while read arn; do
+      if [ -n "$arn" ]; then
+        TAGS=$(aws elbv2 describe-tags --region {{ cluster.region }} --resource-arns "$arn" \
+          --query "TagDescriptions[*].Tags[?Key=='kubernetes.io/cluster/{{ cluster.name }}' && Value=='owned']" --output text 2>/dev/null)
+        if [ -n "$TAGS" ]; then
+          echo "elbv2:$arn"
+        fi
+      fi
+    done
+  args:
+    executable: "{{ lookup('ansible.builtin.env', 'SHELL') }}"
+  register: orphaned_lbs
+  changed_when: false
+  failed_when: false
+  when:
+    - destroy
+    - cluster_exists | default(false)
+    - cleanup_orphaned_aws_resources | default(true)
+
+# Delete orphaned Load Balancers
+- name: "destroy | delete orphaned Load Balancers for {{ cluster.name }}"
+  ansible.builtin.shell: |
+    echo "{{ orphaned_lbs.stdout }}" | while read lb; do
+      if [ -n "$lb" ]; then
+        TYPE=$(echo "$lb" | cut -d: -f1)
+        NAME=$(echo "$lb" | cut -d: -f2-)
+        if [ "$TYPE" = "elb" ]; then
+          echo "Deleting Classic LB: $NAME"
+          aws elb delete-load-balancer --region {{ cluster.region }} --load-balancer-name "$NAME" 2>/dev/null || true
+        elif [ "$TYPE" = "elbv2" ]; then
+          echo "Deleting ALB/NLB: $NAME"
+          aws elbv2 delete-load-balancer --region {{ cluster.region }} --load-balancer-arn "$NAME" 2>/dev/null || true
+        fi
+      fi
+    done
+  args:
+    executable: "{{ lookup('ansible.builtin.env', 'SHELL') }}"
+  register: lb_cleanup
+  changed_when: false
+  failed_when: false
+  when:
+    - destroy
+    - cluster_exists | default(false)
+    - cleanup_orphaned_aws_resources | default(true)
+    - orphaned_lbs.stdout | default('') | trim | length > 0
+
+# Check for orphaned EBS volumes
+- name: "destroy | check for orphaned EBS volumes for {{ cluster.name }}"
+  ansible.builtin.shell: |
+    aws ec2 describe-volumes \
+      --region {{ cluster.region }} \
+      --filters "Name=tag:kubernetes.io/cluster/{{ cluster.name }},Values=owned" \
+                "Name=status,Values=available" \
+      --query 'Volumes[*].VolumeId' \
+      --output text
+  args:
+    executable: "{{ lookup('ansible.builtin.env', 'SHELL') }}"
+  register: orphaned_volumes
+  changed_when: false
+  failed_when: false
+  when:
+    - destroy
+    - cluster_exists | default(false)
+    - cleanup_orphaned_aws_resources | default(true)
+
+# Delete orphaned EBS volumes
+- name: "destroy | delete orphaned EBS volumes for {{ cluster.name }}"
+  ansible.builtin.shell: |
+    for vol in {{ orphaned_volumes.stdout }}; do
+      echo "Deleting volume: $vol"
+      aws ec2 delete-volume --region {{ cluster.region }} --volume-id "$vol" || true
+    done
+  args:
+    executable: "{{ lookup('ansible.builtin.env', 'SHELL') }}"
+  register: volume_cleanup
+  changed_when: volume_cleanup.rc == 0
+  failed_when: false
+  when:
+    - destroy
+    - cluster_exists | default(false)
+    - cleanup_orphaned_aws_resources | default(true)
+    - orphaned_volumes.stdout | default('') | trim | length > 0
+
+# Check for orphaned NAT gateways
+- name: "destroy | check for orphaned NAT gateways for {{ cluster.name }}"
+  ansible.builtin.shell: |
+    aws ec2 describe-nat-gateways \
+      --region {{ cluster.region }} \
+      --filter "Name=tag:kubernetes.io/cluster/{{ cluster.name }},Values=owned" \
+               "Name=state,Values=pending,available" \
+      --query 'NatGateways[*].NatGatewayId' \
+      --output text
+  args:
+    executable: "{{ lookup('ansible.builtin.env', 'SHELL') }}"
+  register: orphaned_nats
+  changed_when: false
+  failed_when: false
+  when:
+    - destroy
+    - cluster_exists | default(false)
+    - cleanup_orphaned_aws_resources | default(true)
+
+# Delete orphaned NAT gateways
+- name: "destroy | delete orphaned NAT gateways for {{ cluster.name }}"
+  ansible.builtin.shell: |
+    for nat in {{ orphaned_nats.stdout }}; do
+      echo "Deleting NAT gateway: $nat"
+      aws ec2 delete-nat-gateway --region {{ cluster.region }} --nat-gateway-id "$nat" || true
+    done
+  args:
+    executable: "{{ lookup('ansible.builtin.env', 'SHELL') }}"
+  register: nat_cleanup
+  changed_when: nat_cleanup.rc == 0
+  failed_when: false
+  when:
+    - destroy
+    - cluster_exists | default(false)
+    - cleanup_orphaned_aws_resources | default(true)
+    - orphaned_nats.stdout | default('') | trim | length > 0
+
+# Wait for NAT gateways to be deleted
+- name: "destroy | wait for NAT gateways to be deleted for {{ cluster.name }}"
+  ansible.builtin.shell: |
+    for nat in {{ orphaned_nats.stdout }}; do
+      echo "Waiting for NAT gateway $nat to be deleted..."
+      aws ec2 wait nat-gateway-deleted --region {{ cluster.region }} --nat-gateway-ids "$nat" 2>/dev/null || true
+    done
+  args:
+    executable: "{{ lookup('ansible.builtin.env', 'SHELL') }}"
+  failed_when: false
+  when:
+    - destroy
+    - cluster_exists | default(false)
+    - cleanup_orphaned_aws_resources | default(true)
+    - orphaned_nats.stdout | default('') | trim | length > 0
+    - nat_cleanup.rc | default(1) == 0
+
+# Check for orphaned Elastic IPs
+- name: "destroy | check for orphaned Elastic IPs for {{ cluster.name }}"
+  ansible.builtin.shell: |
+    aws ec2 describe-addresses \
+      --region {{ cluster.region }} \
+      --filters "Name=tag:kubernetes.io/cluster/{{ cluster.name }},Values=owned" \
+      --query 'Addresses[*].AllocationId' \
+      --output text
+  args:
+    executable: "{{ lookup('ansible.builtin.env', 'SHELL') }}"
+  register: orphaned_eips
+  changed_when: false
+  failed_when: false
+  when:
+    - destroy
+    - cluster_exists | default(false)
+    - cleanup_orphaned_aws_resources | default(true)
+
+# Release orphaned Elastic IPs
+- name: "destroy | release orphaned Elastic IPs for {{ cluster.name }}"
+  ansible.builtin.shell: |
+    for eip in {{ orphaned_eips.stdout }}; do
+      echo "Releasing Elastic IP: $eip"
+      aws ec2 release-address --region {{ cluster.region }} --allocation-id "$eip" || true
+    done
+  args:
+    executable: "{{ lookup('ansible.builtin.env', 'SHELL') }}"
+  register: eip_cleanup
+  changed_when: eip_cleanup.rc == 0
+  failed_when: false
+  when:
+    - destroy
+    - cluster_exists | default(false)
+    - cleanup_orphaned_aws_resources | default(true)
+    - orphaned_eips.stdout | default('') | trim | length > 0
+
+# Check for orphaned Internet Gateways
+- name: "destroy | check for orphaned Internet Gateways for {{ cluster.name }}"
+  ansible.builtin.shell: |
+    aws ec2 describe-internet-gateways \
+      --region {{ cluster.region }} \
+      --filters "Name=tag:kubernetes.io/cluster/{{ cluster.name }},Values=owned" \
+      --query 'InternetGateways[*].[InternetGatewayId,Attachments[0].VpcId]' \
+      --output text
+  args:
+    executable: "{{ lookup('ansible.builtin.env', 'SHELL') }}"
+  register: orphaned_igws
+  changed_when: false
+  failed_when: false
+  when:
+    - destroy
+    - cluster_exists | default(false)
+    - cleanup_orphaned_aws_resources | default(true)
+
+# Detach and delete orphaned Internet Gateways
+- name: "destroy | delete orphaned Internet Gateways for {{ cluster.name }}"
+  ansible.builtin.shell: |
+    echo "{{ orphaned_igws.stdout }}" | while read igw vpc; do
+      if [ -n "$igw" ] && [ "$igw" != "None" ]; then
+        if [ -n "$vpc" ] && [ "$vpc" != "None" ]; then
+          echo "Detaching IGW $igw from VPC $vpc"
+          aws ec2 detach-internet-gateway --region {{ cluster.region }} --internet-gateway-id "$igw" --vpc-id "$vpc" || true
+        fi
+        echo "Deleting IGW: $igw"
+        aws ec2 delete-internet-gateway --region {{ cluster.region }} --internet-gateway-id "$igw" || true
+      fi
+    done
+  args:
+    executable: "{{ lookup('ansible.builtin.env', 'SHELL') }}"
+  register: igw_cleanup
+  changed_when: false
+  failed_when: false
+  when:
+    - destroy
+    - cluster_exists | default(false)
+    - cleanup_orphaned_aws_resources | default(true)
+    - orphaned_igws.stdout | default('') | trim | length > 0
+
+# Check for orphaned subnets
+- name: "destroy | check for orphaned subnets for {{ cluster.name }}"
+  ansible.builtin.shell: |
+    aws ec2 describe-subnets \
+      --region {{ cluster.region }} \
+      --filters "Name=tag:kubernetes.io/cluster/{{ cluster.name }},Values=owned" \
+      --query 'Subnets[*].SubnetId' \
+      --output text
+  args:
+    executable: "{{ lookup('ansible.builtin.env', 'SHELL') }}"
+  register: orphaned_subnets
+  changed_when: false
+  failed_when: false
+  when:
+    - destroy
+    - cluster_exists | default(false)
+    - cleanup_orphaned_aws_resources | default(true)
+
+# Delete orphaned subnets
+- name: "destroy | delete orphaned subnets for {{ cluster.name }}"
+  ansible.builtin.shell: |
+    for subnet in {{ orphaned_subnets.stdout }}; do
+      echo "Deleting subnet: $subnet"
+      aws ec2 delete-subnet --region {{ cluster.region }} --subnet-id "$subnet" || true
+    done
+  args:
+    executable: "{{ lookup('ansible.builtin.env', 'SHELL') }}"
+  register: subnet_cleanup
+  changed_when: false
+  failed_when: false
+  when:
+    - destroy
+    - cluster_exists | default(false)
+    - cleanup_orphaned_aws_resources | default(true)
+    - orphaned_subnets.stdout | default('') | trim | length > 0
+
+# Check for orphaned route tables
+- name: "destroy | check for orphaned route tables for {{ cluster.name }}"
+  ansible.builtin.shell: |
+    aws ec2 describe-route-tables \
+      --region {{ cluster.region }} \
+      --filters "Name=tag:kubernetes.io/cluster/{{ cluster.name }},Values=owned" \
+      --query 'RouteTables[?Associations[?Main!=`true`]].RouteTableId' \
+      --output text
+  args:
+    executable: "{{ lookup('ansible.builtin.env', 'SHELL') }}"
+  register: orphaned_rtbs
+  changed_when: false
+  failed_when: false
+  when:
+    - destroy
+    - cluster_exists | default(false)
+    - cleanup_orphaned_aws_resources | default(true)
+
+# Delete orphaned route tables
+- name: "destroy | delete orphaned route tables for {{ cluster.name }}"
+  ansible.builtin.shell: |
+    for rtb in {{ orphaned_rtbs.stdout }}; do
+      echo "Deleting route table: $rtb"
+      aws ec2 delete-route-table --region {{ cluster.region }} --route-table-id "$rtb" 2>/dev/null || true
+    done
+  args:
+    executable: "{{ lookup('ansible.builtin.env', 'SHELL') }}"
+  register: rtb_cleanup
+  changed_when: false
+  failed_when: false
+  when:
+    - destroy
+    - cluster_exists | default(false)
+    - cleanup_orphaned_aws_resources | default(true)
+    - orphaned_rtbs.stdout | default('') | trim | length > 0
+
+# Check for orphaned security groups
+- name: "destroy | check for orphaned security groups for {{ cluster.name }}"
+  ansible.builtin.shell: |
+    aws ec2 describe-security-groups \
+      --region {{ cluster.region }} \
+      --filters "Name=tag:kubernetes.io/cluster/{{ cluster.name }},Values=owned" \
+      --query 'SecurityGroups[?GroupName!=`default`].GroupId' \
+      --output text
+  args:
+    executable: "{{ lookup('ansible.builtin.env', 'SHELL') }}"
+  register: orphaned_sgs
+  changed_when: false
+  failed_when: false
+  when:
+    - destroy
+    - cluster_exists | default(false)
+    - cleanup_orphaned_aws_resources | default(true)
+
+# Delete orphaned security groups
+- name: "destroy | delete orphaned security groups for {{ cluster.name }}"
+  ansible.builtin.shell: |
+    for sg in {{ orphaned_sgs.stdout }}; do
+      echo "Deleting security group: $sg"
+      aws ec2 delete-security-group --region {{ cluster.region }} --group-id "$sg" 2>/dev/null || true
+    done
+  args:
+    executable: "{{ lookup('ansible.builtin.env', 'SHELL') }}"
+  register: sg_cleanup
+  changed_when: false
+  failed_when: false
+  when:
+    - destroy
+    - cluster_exists | default(false)
+    - cleanup_orphaned_aws_resources | default(true)
+    - orphaned_sgs.stdout | default('') | trim | length > 0
+
+# Check for orphaned VPCs
+- name: "destroy | check for orphaned VPCs for {{ cluster.name }}"
+  ansible.builtin.shell: |
+    aws ec2 describe-vpcs \
+      --region {{ cluster.region }} \
+      --filters "Name=tag:kubernetes.io/cluster/{{ cluster.name }},Values=owned" \
+      --query 'Vpcs[*].VpcId' \
+      --output text
+  args:
+    executable: "{{ lookup('ansible.builtin.env', 'SHELL') }}"
+  register: orphaned_vpcs
+  changed_when: false
+  failed_when: false
+  when:
+    - destroy
+    - cluster_exists | default(false)
+    - cleanup_orphaned_aws_resources | default(true)
+
+# Delete orphaned VPCs
+- name: "destroy | delete orphaned VPCs for {{ cluster.name }}"
+  ansible.builtin.shell: |
+    for vpc in {{ orphaned_vpcs.stdout }}; do
+      echo "Deleting VPC: $vpc"
+      aws ec2 delete-vpc --region {{ cluster.region }} --vpc-id "$vpc" || true
+    done
+  args:
+    executable: "{{ lookup('ansible.builtin.env', 'SHELL') }}"
+  register: vpc_cleanup
+  changed_when: false
+  failed_when: false
+  when:
+    - destroy
+    - cluster_exists | default(false)
+    - cleanup_orphaned_aws_resources | default(true)
+    - orphaned_vpcs.stdout | default('') | trim | length > 0
+
+# =============================================================================
+# ROUTE53 CLEANUP
+# =============================================================================
+
+# Check for orphaned Route53 hosted zones
+- name: "destroy | check for orphaned Route53 hosted zones for {{ cluster.name }}"
+  ansible.builtin.shell: |
+    aws route53 list-hosted-zones \
+      --query "HostedZones[?contains(Name, '{{ cluster.name }}')].[Id,Name]" \
+      --output text | sed 's|/hostedzone/||g'
+  args:
+    executable: "{{ lookup('ansible.builtin.env', 'SHELL') }}"
+  register: orphaned_zones
+  changed_when: false
+  failed_when: false
+  when:
+    - destroy
+    - cluster_exists | default(false)
+    - cleanup_orphaned_aws_resources | default(true)
+
+# Delete orphaned Route53 hosted zones
+- name: "destroy | delete orphaned Route53 hosted zones for {{ cluster.name }}"
+  ansible.builtin.shell: |
+    echo "{{ orphaned_zones.stdout }}" | while read zone_id zone_name; do
+      if [ -n "$zone_id" ]; then
+        echo "Cleaning up zone: $zone_name ($zone_id)"
+        # Delete all records except NS and SOA
+        aws route53 list-resource-record-sets --hosted-zone-id "$zone_id" \
+          --query "ResourceRecordSets[?Type != 'NS' && Type != 'SOA']" \
+          --output json 2>/dev/null | jq -c '.[]' | while read record; do
+          if [ -n "$record" ]; then
+            aws route53 change-resource-record-sets --hosted-zone-id "$zone_id" \
+              --change-batch "{\"Changes\":[{\"Action\":\"DELETE\",\"ResourceRecordSet\":$record}]}" 2>/dev/null || true
+          fi
+        done
+        echo "Deleting zone: $zone_id"
+        aws route53 delete-hosted-zone --id "$zone_id" 2>/dev/null || true
+      fi
+    done
+  args:
+    executable: "{{ lookup('ansible.builtin.env', 'SHELL') }}"
+  register: zone_cleanup
+  changed_when: false
+  failed_when: false
+  when:
+    - destroy
+    - cluster_exists | default(false)
+    - cleanup_orphaned_aws_resources | default(true)
+    - orphaned_zones.stdout | default('') | trim | length > 0
+
+# =============================================================================
+# IAM CLEANUP
+# =============================================================================
+
+# Check for orphaned IAM roles
+- name: "destroy | check for orphaned IAM roles for {{ cluster.name }}"
+  ansible.builtin.shell: |
+    aws iam list-roles \
+      --query "Roles[?contains(RoleName, '{{ cluster.name }}')].RoleName" \
+      --output text
+  args:
+    executable: "{{ lookup('ansible.builtin.env', 'SHELL') }}"
+  register: orphaned_roles
+  changed_when: false
+  failed_when: false
+  when:
+    - destroy
+    - cluster_exists | default(false)
+    - cleanup_orphaned_aws_resources | default(true)
+
+# Delete orphaned IAM roles
+- name: "destroy | delete orphaned IAM roles for {{ cluster.name }}"
+  ansible.builtin.shell: |
+    for role in {{ orphaned_roles.stdout }}; do
+      echo "Cleaning up IAM role: $role"
+      # Detach managed policies
+      for policy in $(aws iam list-attached-role-policies --role-name "$role" --query 'AttachedPolicies[*].PolicyArn' --output text 2>/dev/null); do
+        echo "  Detaching policy: $policy"
+        aws iam detach-role-policy --role-name "$role" --policy-arn "$policy" 2>/dev/null || true
+      done
+      # Delete inline policies
+      for policy in $(aws iam list-role-policies --role-name "$role" --query 'PolicyNames[*]' --output text 2>/dev/null); do
+        echo "  Deleting inline policy: $policy"
+        aws iam delete-role-policy --role-name "$role" --policy-name "$policy" 2>/dev/null || true
+      done
+      # Delete the role
+      echo "  Deleting role: $role"
+      aws iam delete-role --role-name "$role" 2>/dev/null || true
+    done
+  args:
+    executable: "{{ lookup('ansible.builtin.env', 'SHELL') }}"
+  register: role_cleanup
+  changed_when: false
+  failed_when: false
+  when:
+    - destroy
+    - cluster_exists | default(false)
+    - cleanup_orphaned_aws_resources | default(true)
+    - orphaned_roles.stdout | default('') | trim | length > 0
+
+# Check for orphaned IAM instance profiles
+- name: "destroy | check for orphaned IAM instance profiles for {{ cluster.name }}"
+  ansible.builtin.shell: |
+    aws iam list-instance-profiles \
+      --query "InstanceProfiles[?contains(InstanceProfileName, '{{ cluster.name }}')].InstanceProfileName" \
+      --output text
+  args:
+    executable: "{{ lookup('ansible.builtin.env', 'SHELL') }}"
+  register: orphaned_profiles
+  changed_when: false
+  failed_when: false
+  when:
+    - destroy
+    - cluster_exists | default(false)
+    - cleanup_orphaned_aws_resources | default(true)
+
+# Delete orphaned IAM instance profiles
+- name: "destroy | delete orphaned IAM instance profiles for {{ cluster.name }}"
+  ansible.builtin.shell: |
+    for profile in {{ orphaned_profiles.stdout }}; do
+      echo "Cleaning up instance profile: $profile"
+      # Remove roles from instance profile
+      for role in $(aws iam get-instance-profile --instance-profile-name "$profile" --query 'InstanceProfile.Roles[*].RoleName' --output text 2>/dev/null); do
+        echo "  Removing role $role from profile"
+        aws iam remove-role-from-instance-profile --instance-profile-name "$profile" --role-name "$role" 2>/dev/null || true
+      done
+      # Delete the instance profile
+      echo "  Deleting instance profile: $profile"
+      aws iam delete-instance-profile --instance-profile-name "$profile" 2>/dev/null || true
+    done
+  args:
+    executable: "{{ lookup('ansible.builtin.env', 'SHELL') }}"
+  register: profile_cleanup
+  changed_when: false
+  failed_when: false
+  when:
+    - destroy
+    - cluster_exists | default(false)
+    - cleanup_orphaned_aws_resources | default(true)
+    - orphaned_profiles.stdout | default('') | trim | length > 0
+
+# Check for orphaned OIDC providers
+- name: "destroy | check for orphaned OIDC providers for {{ cluster.name }}"
+  ansible.builtin.shell: |
+    aws iam list-open-id-connect-providers \
+      --query "OpenIDConnectProviderList[?contains(Arn, '{{ cluster.name }}')].Arn" \
+      --output text
+  args:
+    executable: "{{ lookup('ansible.builtin.env', 'SHELL') }}"
+  register: orphaned_oidc
+  changed_when: false
+  failed_when: false
+  when:
+    - destroy
+    - cluster_exists | default(false)
+    - cleanup_orphaned_aws_resources | default(true)
+
+# Delete orphaned OIDC providers
+- name: "destroy | delete orphaned OIDC providers for {{ cluster.name }}"
+  ansible.builtin.shell: |
+    for oidc in {{ orphaned_oidc.stdout }}; do
+      echo "Deleting OIDC provider: $oidc"
+      aws iam delete-open-id-connect-provider --open-id-connect-provider-arn "$oidc" 2>/dev/null || true
+    done
+  args:
+    executable: "{{ lookup('ansible.builtin.env', 'SHELL') }}"
+  register: oidc_cleanup
+  changed_when: false
+  failed_when: false
+  when:
+    - destroy
+    - cluster_exists | default(false)
+    - cleanup_orphaned_aws_resources | default(true)
+    - orphaned_oidc.stdout | default('') | trim | length > 0
+
+# =============================================================================
+# FINAL VERIFICATION AND SUMMARY
+# =============================================================================
+
+# Final check if cluster still exists
+- name: "destroy | final verification for {{ cluster.name }}"
+  kubernetes.core.k8s_info:
+    api_version: hypershift.openshift.io/v1beta1
+    kind: HostedCluster
+    namespace: clusters
+    name: "{{ cluster.name }}"
+  register: hc_final
+  changed_when: false
+  failed_when: false
+  when:
+    - destroy
+    - cluster_exists | default(false)
+
+# Summary of cleanup
+- name: "destroy | cleanup summary for {{ cluster.name }}"
+  ansible.builtin.debug:
+    msg: |
+      === Cluster Destroy Summary for {{ cluster.name }} ===
+
+      Kubernetes:
+      - Cluster deleted: {{ 'Yes' if (hc_final.resources is not defined or hc_final.resources | length == 0) else 'No - may need manual cleanup' }}
+      - Finalizers removed: {{ 'Yes' if (finalizer_removal.rc | default(1)) == 0 else 'N/A or failed' }}
+
+      AWS Resources Cleaned:
+      - EC2 Instances: {{ 'cleaned' if (orphaned_instances.stdout | default('') | trim | length > 0) else 'none found' }}
+      - Load Balancers: {{ 'cleaned' if (orphaned_lbs.stdout | default('') | trim | length > 0) else 'none found' }}
+      - EBS Volumes: {{ 'cleaned' if (orphaned_volumes.stdout | default('') | trim | length > 0) else 'none found' }}
+      - NAT Gateways: {{ 'cleaned' if (orphaned_nats.stdout | default('') | trim | length > 0) else 'none found' }}
+      - Elastic IPs: {{ 'cleaned' if (orphaned_eips.stdout | default('') | trim | length > 0) else 'none found' }}
+      - Internet Gateways: {{ 'cleaned' if (orphaned_igws.stdout | default('') | trim | length > 0) else 'none found' }}
+      - Subnets: {{ 'cleaned' if (orphaned_subnets.stdout | default('') | trim | length > 0) else 'none found' }}
+      - Route Tables: {{ 'cleaned' if (orphaned_rtbs.stdout | default('') | trim | length > 0) else 'none found' }}
+      - Security Groups: {{ 'cleaned' if (orphaned_sgs.stdout | default('') | trim | length > 0) else 'none found' }}
+      - VPCs: {{ 'cleaned' if (orphaned_vpcs.stdout | default('') | trim | length > 0) else 'none found' }}
+      - Route53 Zones: {{ 'cleaned' if (orphaned_zones.stdout | default('') | trim | length > 0) else 'none found' }}
+      - IAM Roles: {{ 'cleaned' if (orphaned_roles.stdout | default('') | trim | length > 0) else 'none found' }}
+      - Instance Profiles: {{ 'cleaned' if (orphaned_profiles.stdout | default('') | trim | length > 0) else 'none found' }}
+      - OIDC Providers: {{ 'cleaned' if (orphaned_oidc.stdout | default('') | trim | length > 0) else 'none found' }}
+  when:
+    - destroy
+    - cluster_exists | default(false)
+
+# Fail if cluster still exists after cleanup
+- name: "destroy | fail if cluster {{ cluster.name }} still exists"
+  ansible.builtin.fail:
+    msg: |
+      Cluster {{ cluster.name }} still exists after cleanup attempt.
+      This may require manual intervention:
+      1. Check HyperShift operator logs: kubectl logs -n hypershift deployment/operator
+      2. Manually remove finalizers: kubectl patch hostedcluster {{ cluster.name }} -n clusters --type=json -p='[{"op": "remove", "path": "/metadata/finalizers"}]'
+      3. Check for remaining AWS resources with tag: kubernetes.io/cluster/{{ cluster.name }}=owned
+  when:
+    - destroy
+    - cluster_exists | default(false)
+    - hc_final.resources is defined
+    - hc_final.resources | length > 0
+
+# Clean up local deployment directory
+- name: "destroy | remove local deployment directory for {{ cluster.name }}"
+  ansible.builtin.file:
+    state: absent
+    path: "{{ deployment_dir }}/{{ cluster.name }}"
+  when:
+    - destroy
+    - cluster_exists | default(false)

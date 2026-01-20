@@ -25,6 +25,14 @@ iam:
 wait_timeout_seconds: 900        # Max time to wait (900 seconds = 15 minutes)
 check_interval_seconds: 10       # How often to poll the resource status
 
+# Destroy-specific timeouts
+hcp_destroy_timeout_seconds: 900        # Max time for hcp destroy async job (15 minutes)
+destroy_wait_timeout_seconds: 600       # Max time to wait for hcp destroy to complete (10 minutes - 60 retries * 10s)
+
+# Tag-based AWS resource cleanup (fallback when operator fails)
+# Set to false to disable automatic cleanup of orphaned AWS resources
+cleanup_orphaned_aws_resources: true
+
 # Additional tags to apply to AWS resources created by hcp CLI
 # Format: "Key1=Value1,Key2=Value2" or list ["Key1=Value1", "Key2=Value2"]
 # Can be set globally here or per-cluster in vars.yml
