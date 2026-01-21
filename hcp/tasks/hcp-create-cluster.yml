@@ -150,7 +150,7 @@
     - "'Completed' in (hc_status.resources[0] | community.general.json_query('status.version.history[*].state'))"
   retries: "{{ (wait_timeout_seconds / check_interval_seconds) | int }}"
   delay: "{{ check_interval_seconds }}"
-  failed_when: false  # Don't fail if kubeconfig is not available
+  failed_when: false  # Best-effort check; API reachability task below provides the real validation
   when: 
     - cluster_create_async is defined
     - cluster_create_async.ansible_job_id is defined
@@ -163,6 +163,18 @@
     hcp create kubeconfig --name {{ cluster.name }} > {{ deployment_dir }}/{{ cluster.name }}/auth/kubeconfig
   args:
     executable: "{{lookup('ansible.builtin.env', 'SHELL')}}"
+  when: cluster_create_async is defined
+
+- name: "post-install | wait for cluster API to be reachable for {{ cluster.name }}"
+  ansible.builtin.shell: |
+    export KUBECONFIG="{{ deployment_dir }}/{{ cluster.name }}/auth/kubeconfig"
+    oc get nodes --request-timeout=10s
+  args:
+    executable: "{{lookup('ansible.builtin.env', 'SHELL')}}"
+  register: api_check
+  until: api_check.rc == 0
+  retries: 60
+  delay: 10
   when: cluster_create_async is defined
 
 - name: "post-install | get kubeadmin password secret for {{ cluster.name }} cluster"
