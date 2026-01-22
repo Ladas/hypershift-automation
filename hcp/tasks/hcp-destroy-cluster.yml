@@ -861,6 +861,122 @@
     - destroy
     - cluster_exists | default(false)
 
+# =============================================================================
+# STAGE 7: Clean up control plane namespace
+# =============================================================================
+# The control plane namespace (clusters-<cluster-name>) may remain after
+# HostedCluster deletion. This contains deployments, pods, secrets, etc.
+# that were managing the hosted control plane.
+
+- name: "destroy | check if control plane namespace exists for {{ cluster.name }}"
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Namespace
+    name: "clusters-{{ cluster.name }}"
+  register: cp_namespace
+  changed_when: false
+  failed_when: false
+  when: destroy
+
+- name: "destroy | clean up control plane namespace for {{ cluster.name }}"
+  when:
+    - destroy
+    - cp_namespace.resources is defined
+    - cp_namespace.resources | length > 0
+  block:
+    # Delete workloads first (these create/recreate other resources)
+    - name: "destroy | delete deployments in control plane namespace {{ cluster.name }}"
+      ansible.builtin.shell: |
+        kubectl delete deployment --all -n "clusters-{{ cluster.name }}" --grace-period=0 --force --ignore-not-found 2>/dev/null || true
+      failed_when: false
+      changed_when: true
+
+    - name: "destroy | delete replicasets in control plane namespace {{ cluster.name }}"
+      ansible.builtin.shell: |
+        kubectl delete replicaset --all -n "clusters-{{ cluster.name }}" --grace-period=0 --force --ignore-not-found 2>/dev/null || true
+      failed_when: false
+      changed_when: true
+
+    - name: "destroy | delete statefulsets in control plane namespace {{ cluster.name }}"
+      ansible.builtin.shell: |
+        kubectl delete statefulset --all -n "clusters-{{ cluster.name }}" --grace-period=0 --force --ignore-not-found 2>/dev/null || true
+      failed_when: false
+      changed_when: true
+
+    - name: "destroy | delete pods in control plane namespace {{ cluster.name }}"
+      ansible.builtin.shell: |
+        kubectl delete pod --all -n "clusters-{{ cluster.name }}" --grace-period=0 --force --ignore-not-found 2>/dev/null || true
+      failed_when: false
+      changed_when: true
+
+    - name: "destroy | delete services in control plane namespace {{ cluster.name }}"
+      ansible.builtin.shell: |
+        kubectl delete service --all -n "clusters-{{ cluster.name }}" --ignore-not-found 2>/dev/null || true
+      failed_when: false
+      changed_when: true
+
+    - name: "destroy | delete secrets in control plane namespace {{ cluster.name }}"
+      ansible.builtin.shell: |
+        kubectl delete secret --all -n "clusters-{{ cluster.name }}" --ignore-not-found 2>/dev/null || true
+      failed_when: false
+      changed_when: true
+
+    - name: "destroy | delete configmaps in control plane namespace {{ cluster.name }}"
+      ansible.builtin.shell: |
+        kubectl delete configmap --all -n "clusters-{{ cluster.name }}" --ignore-not-found 2>/dev/null || true
+      failed_when: false
+      changed_when: true
+
+    - name: "destroy | delete PVCs in control plane namespace {{ cluster.name }}"
+      ansible.builtin.shell: |
+        kubectl delete pvc --all -n "clusters-{{ cluster.name }}" --ignore-not-found 2>/dev/null || true
+      failed_when: false
+      changed_when: true
+
+    # Remove any finalizers from remaining resources
+    - name: "destroy | patch finalizers on remaining resources in {{ cluster.name }}"
+      ansible.builtin.shell: |
+        for kind in hostedcontrolplane deployment replicaset statefulset daemonset service secret configmap pvc; do
+          kubectl get "$kind" -n "clusters-{{ cluster.name }}" -o name 2>/dev/null | while read -r name; do
+            kubectl patch "$name" -n "clusters-{{ cluster.name }}" -p '{"metadata":{"finalizers":null}}' --type=merge 2>/dev/null || true
+          done
+        done
+      failed_when: false
+      changed_when: true
+
+    # Delete the namespace
+    - name: "destroy | delete control plane namespace {{ cluster.name }}"
+      kubernetes.core.k8s:
+        state: absent
+        api_version: v1
+        kind: Namespace
+        name: "clusters-{{ cluster.name }}"
+        wait: no
+      failed_when: false
+
+    # Patch namespace finalizers if needed
+    - name: "destroy | patch namespace finalizers for {{ cluster.name }}"
+      ansible.builtin.shell: |
+        kubectl patch namespace "clusters-{{ cluster.name }}" -p '{"metadata":{"finalizers":null}}' --type=merge 2>/dev/null || true
+      failed_when: false
+      changed_when: true
+
+    # Wait for namespace deletion
+    - name: "destroy | wait for control plane namespace {{ cluster.name }} to be deleted"
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Namespace
+        name: "clusters-{{ cluster.name }}"
+      register: cp_namespace_final
+      until: cp_namespace_final.resources | length == 0
+      retries: 24
+      delay: 5
+      failed_when: false
+
+    - name: "destroy | log control plane namespace cleanup result for {{ cluster.name }}"
+      ansible.builtin.debug:
+        msg: "Control plane namespace clusters-{{ cluster.name }}: {{ 'deleted' if (cp_namespace_final.resources | length == 0) else 'still exists - may need manual cleanup' }}"
+
 # Fail if cluster still exists after cleanup
 - name: "destroy | fail if cluster {{ cluster.name }} still exists"
   ansible.builtin.fail:
