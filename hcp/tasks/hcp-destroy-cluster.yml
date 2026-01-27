@@ -621,6 +621,31 @@
     - cluster_exists | default(false)
     - cleanup_orphaned_aws_resources | default(true)
 
+# Delete VPC endpoints (must be done before VPC deletion)
+- name: "destroy | delete VPC endpoints for {{ cluster.name }}"
+  ansible.builtin.shell: |
+    for vpc in {{ orphaned_vpcs.stdout }}; do
+      vpce_ids=$(aws ec2 describe-vpc-endpoints \
+        --region {{ cluster.region }} \
+        --filters "Name=vpc-id,Values=$vpc" \
+        --query 'VpcEndpoints[*].VpcEndpointId' \
+        --output text 2>/dev/null)
+      if [ -n "$vpce_ids" ] && [ "$vpce_ids" != "None" ]; then
+        echo "Deleting VPC endpoints for $vpc: $vpce_ids"
+        aws ec2 delete-vpc-endpoints --region {{ cluster.region }} --vpc-endpoint-ids $vpce_ids || true
+      fi
+    done
+  args:
+    executable: "{{ lookup('ansible.builtin.env', 'SHELL') }}"
+  register: vpce_cleanup
+  changed_when: false
+  failed_when: false
+  when:
+    - destroy
+    - cluster_exists | default(false)
+    - cleanup_orphaned_aws_resources | default(true)
+    - orphaned_vpcs.stdout | default('') | trim | length > 0
+
 # Delete orphaned VPCs
 - name: "destroy | delete orphaned VPCs for {{ cluster.name }}"
   ansible.builtin.shell: |
@@ -852,6 +877,7 @@
       - Subnets: {{ 'cleaned' if (orphaned_subnets.stdout | default('') | trim | length > 0) else 'none found' }}
       - Route Tables: {{ 'cleaned' if (orphaned_rtbs.stdout | default('') | trim | length > 0) else 'none found' }}
       - Security Groups: {{ 'cleaned' if (orphaned_sgs.stdout | default('') | trim | length > 0) else 'none found' }}
+      - VPC Endpoints: {{ 'cleaned' if (vpce_cleanup is defined and vpce_cleanup.stdout | default('') | trim | length > 0) else 'none found' }}
       - VPCs: {{ 'cleaned' if (orphaned_vpcs.stdout | default('') | trim | length > 0) else 'none found' }}
       - Route53 Zones: {{ 'cleaned' if (orphaned_zones.stdout | default('') | trim | length > 0) else 'none found' }}
       - IAM Roles: {{ 'cleaned' if (orphaned_roles.stdout | default('') | trim | length > 0) else 'none found' }}
