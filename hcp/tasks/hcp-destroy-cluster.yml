@@ -532,12 +532,14 @@
     - orphaned_subnets.stdout | default('') | trim | length > 0
 
 # Check for orphaned route tables
+# Note: Query must catch route tables with NO associations (orphaned) AND those with non-main associations
+# The old query [?Associations[?Main!=true]] missed route tables with no associations at all
 - name: "destroy | check for orphaned route tables for {{ cluster.name }}"
   ansible.builtin.shell: |
     aws ec2 describe-route-tables \
       --region {{ cluster.region }} \
       --filters "Name=tag:kubernetes.io/cluster/{{ cluster.name }},Values=owned" \
-      --query 'RouteTables[?Associations[?Main!=`true`]].RouteTableId' \
+      --query 'RouteTables[?!Associations[?Main==`true`]].RouteTableId' \
       --output text
   args:
     executable: "{{ lookup('ansible.builtin.env', 'SHELL') }}"
