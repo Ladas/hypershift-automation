@@ -177,6 +177,41 @@
   delay: 10
   when: cluster_create_async is defined
 
+# Configure NodePool autoscaling if min/max are specified
+# This patches the NodePool to enable autoscaling after cluster creation.
+# The replicas field is removed (mutually exclusive with autoScaling).
+# See: https://hypershift-docs.netlify.app/reference/api/#hypershift.openshift.io/v1beta1.NodePoolAutoScaling
+- name: "post-install | configure NodePool autoscaling for {{ cluster.name }}"
+  kubernetes.core.k8s:
+    state: patched
+    api_version: hypershift.openshift.io/v1beta1
+    kind: NodePool
+    name: "{{ cluster.name }}"
+    namespace: clusters
+    definition:
+      spec:
+        replicas: null
+        autoScaling:
+          min: "{{ cluster.autoscaling.min }}"
+          max: "{{ cluster.autoscaling.max }}"
+  when:
+    - cluster_create_async is defined
+    - cluster.autoscaling is defined
+    - cluster.autoscaling.min is defined
+    - cluster.autoscaling.max is defined
+
+- name: "post-install | NodePool autoscaling configured for {{ cluster.name }}"
+  ansible.builtin.debug:
+    msg: |
+      NodePool autoscaling enabled for {{ cluster.name }}:
+        min: {{ cluster.autoscaling.min }}
+        max: {{ cluster.autoscaling.max }}
+      The cluster-autoscaler will now manage node scaling.
+  when:
+    - cluster.autoscaling is defined
+    - cluster.autoscaling.min is defined
+    - cluster.autoscaling.max is defined
+
 - name: "post-install | get kubeadmin password secret for {{ cluster.name }} cluster"
   kubernetes.core.k8s_info:
     api_version: v1

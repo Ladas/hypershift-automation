@@ -20,7 +20,8 @@ This list of variables are for the cluster lifecycle.
 | destroy   | false   | set true to destroy cluster |
 | create_iam | false | set true to create iam roles and policies |
 | name | `hcpdflt` | cluster name (also used for infraID) |
-| replicas | `1` | Number of machines to create |
+| replicas | `1` | Number of machines to create (initial count, ignored if autoscaling is set) |
+| autoscaling | `{}` | NodePool autoscaling config: `{"min": 1, "max": 3}`. Enables cluster-autoscaler. |
 | instance_type | `m5.xlarge` | AWS Machine type |
 | domain | `example.com` | base domain for route53 and cluster deployment |
 | region | `us-west-2` | default region to deploy resources |
